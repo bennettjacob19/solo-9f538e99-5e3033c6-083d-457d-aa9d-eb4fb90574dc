@@ -11,11 +11,14 @@
 /data
 ├── originals/            # 原始文本，位于两台执行器目录之外（第三个文件系统）
 │   └── <job>/shard-<n>.txt
-├── exec-a/<job>/shard-<n>.wc.json   # 执行器 A 的分片词频（Shuffle）文件
-├── exec-b/<job>/shard-<n>.wc.json   # 执行器 B 的分片词频文件
-└── state/manifest.json   # 分片位置清单（唯一的状态真相来源，原子落盘）
+├── exec-a/gen-<epoch>/<job>/shard-<n>.wc.json   # 执行器 A 的分片词频（Shuffle）文件
+├── exec-b/gen-<epoch>/<job>/shard-<n>.wc.json   # 执行器 B 的分片词频文件
+└── state/manifest.json   # 分片位置清单（唯一的状态真相来源，原子落盘，含 epoch）
 ```
 
+- `gen-<epoch>` 是**演练代际目录**：每次 `/admin/reset` 让清单里的 `epoch` 加一，
+  新一轮的词频文件全部落在新的 `gen-<epoch>` 目录里，旧下线流程拿到的旧路径
+  物理上无法触及新一轮文件（详见 3.5）。
 - `docker compose up` 时，`exec-a`、`exec-b` 分别挂载**两个独立 tmpfs**，
   `st_dev` 不同（`GET /filesystems` 可验证），因此跨执行器交接不能用 rename，
   只能按字节复制（对应真实的 EXDEV 语义）。
@@ -30,7 +33,7 @@
 | POST | `/executors/decommission` | 下线执行器；请求体给 `copy_byte_budget`（中间文件复制字节上限） |
 | GET | `/executors` | 执行器状态（ACTIVE/DECOMMISSIONING/DECOMMISSIONED）及名下分片 |
 | GET | `/filesystems` | 各目录的设备号，证明执行器目录位于不同文件系统 |
-| POST | `/admin/reset` | 演练用，清空全部数据回到初始状态 |
+| POST | `/admin/reset` | 演练用，立刻进入新的一代（epoch+1）并复用全部编号；不等待在途下线 |
 
 下线响应（成功）包含：`copied_bytes`（实际复制字节数）、`copied_shard_ids`、
 `recomputed_shard_id`（重算的分片号，最多一个）、`moved_shards`（新位置）。
@@ -70,6 +73,32 @@
 ### 3.4 持久化与崩溃恢复
 清单每次变更都 fsync 落盘。重启时若发现执行器停在 DECOMMISSIONING（进程在
 阶段 1/2 之间崩溃），自动恢复为 ACTIVE——此时源文件从未被删除，数据无损失。
+启动时还会清扫与当前 epoch 不符的遗留 `gen-*` 目录，回收崩溃残留占用的 tmpfs。
+
+### 3.5 重置（reset）与在途下线的代际隔离
+在 `/docs` 反复演练时，可能在上一个下线还在复制/重算/清理时就重置，并用**同一
+作业号、同一分片号**重新提交。旧实现按裸路径清理，会把刚收下的新一轮词频文件
+误删。修复依赖两层机制：
+
+1. **代际目录（命名空间隔离）**：清单带单调递增 `epoch`，词频文件路径为
+   `<executor>/gen-<epoch>/<job>/shard-<n>.wc.json`。重置后新文件进入新的
+   `gen-<epoch+1>`，旧下线持有的所有路径（复制源/目标、清理目标、回滚目标）
+   都在旧 `gen-<epoch>` 内，目录结构保证它无法覆盖或删除新一轮文件。
+2. **epoch 围栏（状态隔离）**：下线在持锁规划时捕获 `start_epoch`，并在阶段 1
+   每个分片处理前、重算前、阶段 2 清单切换前重新校验；IO 异常的错误路径也会
+   回查。重置使 epoch 变化后：
+   - 尚未完成清单切换的旧下线一律得到 **409 Conflict**（含复制中途被重置
+     unlink 掉源文件的情况），其阶段 2 永远不会执行，新一轮清单与执行器状态
+     不被改动；
+   - 已经完成阶段 2 切换的旧下线**保留原来的成功回执**，其阶段 3 清理只作用于
+     它捕获的旧代际目录，对新一轮是 no-op。
+
+`reset()` 自身在锁内只做元数据（epoch+1、清单清空、执行器回 ACTIVE、一次原子
+落盘），**不复制、不重算、不等待任何在途下线**，回包后编号立即可复用。锁外只做
+unlink：未打开的旧词频文件在回包前就释放 tmpfs 空间（**绝不靠复制原文腾位置**）；
+仍被归并请求打开的文件按 Linux unlink 语义保留 inode，最后一个持有它的请求退出
+后自动释放。旧代际归并若在重置后才找不到文件，其有界重试在新清单中查不到该分片，
+返回 500——它不会影响新一轮（见第 7 节缺项）。
 
 ## 4. 启动方式
 
@@ -93,10 +122,16 @@ python scripts/smoke_demo.py
 行为由 `tests/test_cross_device.py` 用 `/tmp`(overlay) 与 `/dev/shm`(tmpfs)
 两个真实设备覆盖。
 
+重置竞态的真实服务端演练（自动起 uvicorn、用暂停钩子把旧下线停在复制/清理
+阶段，数据根默认放在 `/dev/shm` tmpfs）：
+```bash
+.venv/bin/python -I scripts/run_reset_demo.py
+```
+
 ## 5. 测试
 
 ```bash
-.venv/bin/python -m pytest -q           # 23 个用例
+.venv/bin/python -m pytest -q           # 30 个用例
 ```
 
 | 测试文件 | 覆盖内容 |
@@ -106,19 +141,30 @@ python scripts/smoke_demo.py
 | `test_concurrency.py` | **归并途中下线**（注入延时稳定命中竞态）、6 线程归并与下线并行、预算不足不干扰并发归并、交接不等待归并锁的计时断言 |
 | `test_persistence.py` | 清单重启恢复、崩溃在 DECOMMISSIONING 的恢复、模拟磁盘故障后的回滚、原文缺失导致重算失败并回滚 |
 | `test_cross_device.py` | 两个真实不同块设备（overlay vs tmpfs）之间的交接，验证按字节复制而非 rename |
+| `test_reset_handoff.py` | **重置与在途下线竞态**：复制暂停时重置→旧下线 409、新轮同号文件不被覆盖/删除；清理暂停时重置→已切换的旧下线保留成功回执且碰不到新轮；重置回包前 unlink 回收 tmpfs（不复制原文）；打开的文件在最后 fd 关闭后释放；reset 后 `/filesystems` 与重启恢复；同轮归并读全分片且与下线并行 |
 
 并发测试已连续多轮重复执行无抖动；每次归并结果都断言
 `shards_merged == 分片数` 且总词频与串行期望值完全一致。
 
 ## 6. 实测记录（本仓库环境）
 
-- `pytest -q`：**23 passed**；并发套件连跑 5 轮全部通过。
-- 真实 uvicorn + `scripts/smoke_demo.py` 端到端：预算 0 被拒（复制需求 86B
-  超预算，已含最大分片重算）；给足预算后成功下线，`copied_bytes=86`、
-  `copied_shards=[0,1]`、`recomputed_shard=2`，源目录清空；下线后归并仍为
-  4 个分片、词频不变；向已下线对端再次交接返回 409。
-- 跨设备测试确认 `/tmp`(st_dev=58) → `/dev/shm`(st_dev=111) 交接成功，
+- `pytest -q`：**30 passed**；完整套件（含竞态用例）连跑 6 轮全部通过，无抖动。
+- 真实 uvicorn + `scripts/smoke_demo.py`（数据目录放在 `/dev/shm` tmpfs）端到端：
+  预算 0 被拒（复制需求 86B 超预算，已含最大分片重算）；给足预算后成功下线，
+  `copied_bytes=86`、`copied_shards=[0,1]`、`recomputed_shard=2`，源代际目录清空；
+  下线后归并仍为 4 个分片、词频不变；向已下线对端再次交接返回 409。
+- 真实 uvicorn + `scripts/run_reset_demo.py`（用暂停钩子把旧下线分别停在
+  **复制阶段**和**清理阶段**再 reset）：
+  - 复制暂停：reset 耗时 0.00s 立即返回，同作业号/分片号立刻可复用；旧下线
+    恢复后返回 **409**，新文件 inode 与内容均未被改动，旧 `gen-*` 目录全部回收；
+  - 清理暂停（清单已切换）：旧下线恢复后保留 **200 成功回执**，但其 unlink
+    全部落在旧代际，新一轮同号文件 inode 不变、归并只计新轮分片；
+  - tmpfs 空间：未打开文件在 reset 回包前即回收（实测单次回收 688128B）；
+    被打开的文件 reset 后目录项消失但 inode 仍可读，fd 关闭时才释放其 73728B。
+- 跨设备测试确认 `/tmp`(overlay) → `/dev/shm`(tmpfs) 交接成功，
   迁移后的文件物理位于对端设备。
+- 本环境没有 Docker 守护进程，`docker-compose.yml` 未实际 `up`；其两个
+  `tmpfs` 挂载与卷布局保持不变，上述 tmpfs 实测覆盖了等价的文件系统语义。
 
 ## 7. 已知缺项 / 简化（与真实 Shuffle 服务的差距）
 
@@ -126,8 +172,8 @@ python scripts/smoke_demo.py
    一致性；没有多副本/选主，水平扩展需引入外部注册中心（如 etcd）。compose
    也固定 `--workers 1`。
 2. **故障窗口**：阶段 2（清单已切换）之后、阶段 3 清理完成之前进程崩溃，
-   重启后清单指向对端而旧文件可能残留；当前恢复逻辑只处理
-   DECOMMISSIONING，不清理这种 DECOMMISSIONED 残留（不影响正确性，仅留垃圾）。
+   重启后清单指向对端而旧文件可能残留；启动清扫会按 epoch 回收这类
+   `gen-*` 残留（不影响正确性，仅留待下次启动清理）。
 3. **重算能力上限为 1 个分片**，且固定选最大分片；这是题目约束的直接实现，
    未做更复杂的背包/多选优化。
 4. **无鉴权与多租户**：`/admin/reset` 等接口仅适用于本地演练。
@@ -135,5 +181,10 @@ python scripts/smoke_demo.py
    Linux tmpfs/overlay）；Windows 上该竞态语义不同，未适配。
 6. **tokenizer 仅按空白切分**，不做大小写归一、标点剔除；空文本产生空词频
    文件，仍作为一个分片参与归并。
-7. 本环境没有 Docker 守护进程，compose 文件做了 YAML 校验与等价的跨设备
-   测试，但未在本机实际 `docker compose up` 验证。
+7. **旧代际在途归并遇到 reset**：若归并在 reset 前快照、reset 后才打开文件，
+   其有界 fallback 在新清单中找不到旧分片，会返回 500；该请求属于已被重置
+   废弃的演练轮次，不会污染新一轮（新一轮归并独立验证通过）。要让旧请求也
+   成功，需要保留旧代际直到所有在途请求结束，与"回包前腾出 tmpfs"的要求
+   相冲突，故按当前取舍实现。
+8. **暂停钩子是测试专用接口**：`Store.on_handoff_stage / on_handoff_cleanup /
+   on_merge_file_open` 仅用于稳定复现竞态，生产路径默认全为 `None`，零开销。
