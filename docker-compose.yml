@@ -1,0 +1,33 @@
+# Local shuffle-handoff drill.
+#
+# The two executor roots are mounted from *different* tmpfs instances, so
+# they show different st_dev values (verify with GET /filesystems). Cross-FS
+# handoff therefore cannot rely on rename; the app copies bytes instead.
+# Originals and the manifest live on the container's own (third) file system.
+services:
+  shuffle-drill:
+    build: .
+    image: shuffle-handoff-drill:latest
+    ports:
+      - "8000:8000"
+    environment:
+      SHUFFLE_ORIGINALS_DIR: /data/originals
+      SHUFFLE_EXEC_A_DIR: /data/exec-a
+      SHUFFLE_EXEC_B_DIR: /data/exec-b
+      SHUFFLE_MANIFEST: /data/state/manifest.json
+    tmpfs:
+      # Two independent tmpfs mounts => two distinct block devices.
+      - /data/exec-a:size=64m,mode=1777
+      - /data/exec-b:size=64m,mode=1777
+    volumes:
+      - shuffle-originals:/data/originals
+      - shuffle-state:/data/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  shuffle-originals:
+  shuffle-state:
